@@ -111,10 +111,6 @@ class Bootloader
         }
 
         if (Application::isExperimentalRouterEnabled()) {
-            $app->singleton(
-                \Illuminate\Contracts\Http\Kernel::class,
-                \Roots\Acorn\Http\Kernel::class
-            );
             return $this->bootHttp($app);
         }
 
@@ -206,42 +202,70 @@ class Bootloader
     {
         $kernel = $app->make(\Illuminate\Contracts\Http\Kernel::class);
         $request = \Illuminate\Http\Request::capture();
+        $time = time();
 
         $app->instance('request', $request);
         Facade::clearResolvedInstance('request');
 
         $kernel->bootstrap($request);
 
-        try {
+        add_filter('do_parse_request', function ($do_parse, \WP $wp, $extra_query_vars) use ($app, $request) {
             if (! $app->make('router')->getRoutes()->match($request)) {
-                throw new \Symfony\Component\HttpKernel\Exception\NotFoundHttpException();
+                return $do_parse;
             }
-        } catch (\Exception $e) {
+
+            return apply_filters('acorn/router/do_parse_request', $do_parse, $wp, $extra_query_vars);
+        }, 100, 3);
+
+        // Create a default route for wordpress routes to use
+        $app->make('router')
+            ->any('{any?}', fn () => response()->json(['message' => "wordpress_request_$time" ]))
+            ->where('any', '.*');
+
+        add_action('parse_request', fn () => $this->handleLaravelRequest($time, $kernel, $request));
+    }
+
+    /**
+     * Handle the Request with Laravel's Router
+     *
+     * @param string $time
+     * @param \Illuminate\Contracts\Http\Kernel $kernel
+     * @param \Illuminate\Http\Request $request
+     * @return void
+     */
+    protected function handleLaravelRequest(
+        string $time,
+        \Illuminate\Contracts\Http\Kernel $kernel,
+        \Illuminate\Http\Request $request
+    ) {
+        /**
+         * @var \Symfony\Component\HttpFoundation\Response $response
+         * @see \Illuminate\Contracts\Routing\ResponseFactory
+         */
+        $response = $kernel->handle($request);
+
+        if (
+            $response instanceof \Symfony\Component\HttpFoundation\Response
+            && ! $response->isServerError()
+            && $response->getStatusCode() >= 400
+        ) {
             return;
         }
 
-        add_filter(
-            'do_parse_request',
-            fn ($do_parse, \WP $wp, $extra_query_vars) =>
-            apply_filters('acorn/router/do_parse_request', $do_parse, $wp, $extra_query_vars),
-            100,
-            3
-        );
-
-        add_action('parse_request', function () use ($kernel, $request) {
-            /** @var \Illuminate\Http\Response */
-            $response = $kernel->handle($request);
-
-            if (! $response->isServerError() && $response->status() >= 400) {
-                return;
-            }
-
+        if (
+            in_array(false, [
+            $response instanceof \Illuminate\Http\JsonResponse,
+            is_string($response->getContent()),
+            $data = json_decode($response->getContent()),
+            isset($data->message) && $data->message == "wordpress_request_$time",
+            ])
+        ) {
             $body = $response->send();
 
             $kernel->terminate($request, $body);
 
             exit;
-        });
+        }
     }
 
     /**
@@ -266,19 +290,23 @@ class Bootloader
     {
         $this->app ??= new Application($this->basePath(), $this->usePaths());
 
+        $httpKernel = Application::isExperimentalRouterEnabled()
+            ? \Roots\Acorn\Http\Kernel::class
+            : \Roots\Acorn\Kernel::class;
+
         $this->app->singleton(
             \Illuminate\Contracts\Http\Kernel::class,
-            \Roots\Acorn\Kernel::class
+            apply_filters('acorn/container/http-kernel', $httpKernel)
         );
 
         $this->app->singleton(
             \Illuminate\Contracts\Console\Kernel::class,
-            \Roots\Acorn\Console\Kernel::class
+            apply_filters('acorn/container/console-kernel', \Roots\Acorn\Console\Kernel::class)
         );
 
         $this->app->singleton(
             \Illuminate\Contracts\Debug\ExceptionHandler::class,
-            \Roots\Acorn\Exceptions\Handler::class
+            apply_filters('acorn/container/exception-handler', \Roots\Acorn\Exceptions\Handler::class)
         );
 
         if (class_exists(\Whoops\Run::class)) {
